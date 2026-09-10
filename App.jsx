@@ -1,0 +1,690 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Play, Pause, RotateCcw, Plus, X, Clock, Calendar, CheckSquare, BarChart2, Settings2, Pencil, Radio } from 'lucide-react';
+
+const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const SWATCHES = ['#F2B84C', '#6FA98A', '#7FA8D9', '#D98A73', '#B48AD9', '#5FC2C9', '#E0708A'];
+const DEFAULT_SUBJECTS = [
+  { id: 's1', name: 'Maths', color: '#F2B84C' },
+  { id: 's2', name: 'Physics', color: '#6FA98A' },
+  { id: 's3', name: 'Programming', color: '#7FA8D9' },
+];
+
+function todayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+function currentDayName() {
+  const d = new Date().getDay();
+  return DAYS[(d + 6) % 7];
+}
+function fmtClock(s) {
+  const m = Math.floor(s / 60).toString().padStart(2, '0');
+  const sec = Math.floor(s % 60).toString().padStart(2, '0');
+  return `${m}:${sec}`;
+}
+function fmtHours(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.round((sec % 3600) / 60);
+  if (h === 0) return `${m}m`;
+  return `${h}h ${m}m`;
+}
+function uid() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+const VAPID_PUBLIC_KEY = 'BBpo1a_FtZlLCtNq80rb_JV_6ZxhDMimRdJdM5oUcIaPeMkSO7B_EHc6FlnAPYFvNFDsbap7nuxLveu6xnha_VE';
+
+function getDeviceId() {
+  let id = localStorage.getItem('device-id');
+  if (!id) {
+    id = (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem('device-id', id);
+  }
+  return id;
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  const output = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; i++) output[i] = rawData.charCodeAt(i);
+  return output;
+}
+
+async function subscribeToPush(deviceId) {
+  try {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return false;
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+      });
+    }
+    await fetch('/.netlify/functions/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId, subscription: sub }),
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function syncScheduleToServer(deviceId, schedule, subjects) {
+  try {
+    await fetch('/.netlify/functions/save-schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId, schedule, subjects }),
+    });
+  } catch (e) {
+    /* best effort — client-side reminder still works as fallback */
+  }
+}
+
+async function storageGet(key) {
+  try {
+    const v = localStorage.getItem(key);
+    return v ? JSON.parse(v) : null;
+  } catch (e) {
+    return null;
+  }
+}
+async function storageSet(key, val) {
+  try {
+    localStorage.setItem(key, JSON.stringify(val));
+  } catch (e) {
+    /* best effort */
+  }
+}
+
+export default function StudyTracker() {
+  const [ready, setReady] = useState(false);
+  const [deviceId] = useState(() => getDeviceId());
+  const [tab, setTab] = useState('timer');
+  const [showSubjectPanel, setShowSubjectPanel] = useState(false);
+  const [notifPermission, setNotifPermission] = useState('default');
+
+  const [subjects, setSubjects] = useState(DEFAULT_SUBJECTS);
+  const [todos, setTodos] = useState([]);
+  const [schedule, setSchedule] = useState({});
+  const [dailyLog, setDailyLog] = useState({});
+
+  const [mode, setMode] = useState('pomodoro');
+  const [selectedSubject, setSelectedSubject] = useState(DEFAULT_SUBJECTS[0].id);
+  const [pomodoroFocus, setPomodoroFocus] = useState(25 * 60);
+  const [pomodoroBreak, setPomodoroBreak] = useState(5 * 60);
+  const [secondsLeft, setSecondsLeft] = useState(25 * 60);
+  const [onBreak, setOnBreak] = useState(false);
+  const [stopwatchSeconds, setStopwatchSeconds] = useState(0);
+  const [running, setRunning] = useState(false);
+
+  const [floating, setFloating] = useState(false);
+  const [pos, setPos] = useState({ x: 16, y: 90 });
+  const dragRef = useRef(null);
+
+  const [newTodo, setNewTodo] = useState('');
+  const [newTodoSubject, setNewTodoSubject] = useState('');
+
+  const notifiedRef = useRef(new Set());
+
+  // ---- load persisted data ----
+  useEffect(() => {
+    (async () => {
+      const s = await storageGet('subjects');
+      if (s) {
+        setSubjects(s);
+        if (s[0]) setSelectedSubject(s[0].id);
+      }
+      const t = await storageGet('todos');
+      if (t) setTodos(t);
+      const sc = await storageGet('schedule');
+      if (sc) setSchedule(sc);
+      const dl = await storageGet('daily-log');
+      if (dl) setDailyLog(dl);
+      const st = await storageGet('settings');
+      if (st) {
+        if (st.pomodoroFocus) { setPomodoroFocus(st.pomodoroFocus); setSecondsLeft(st.pomodoroFocus); }
+        if (st.pomodoroBreak) setPomodoroBreak(st.pomodoroBreak);
+      }
+      setReady(true);
+    })();
+    try {
+      if (typeof Notification !== 'undefined') {
+        setNotifPermission(Notification.permission);
+        if (Notification.permission === 'granted') subscribeToPush(deviceId);
+      }
+    } catch (e) {}
+  }, []);
+
+  const requestNotif = () => {
+    try {
+      Notification.requestPermission().then((p) => {
+        setNotifPermission(p);
+        if (p === 'granted') subscribeToPush(deviceId);
+      });
+    } catch (e) {}
+  };
+
+  const beep = useCallback(() => {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.connect(g);
+      g.connect(ctx.destination);
+      o.frequency.value = 830;
+      g.gain.setValueAtTime(0.25, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.6);
+      o.start();
+      o.stop(ctx.currentTime + 0.6);
+    } catch (e) {}
+  }, []);
+
+  const notify = useCallback((title, body) => {
+    beep();
+    try {
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        new Notification(title, { body });
+      }
+    } catch (e) {}
+  }, [beep]);
+
+  const logTime = useCallback((subjectId, secs) => {
+    if (secs <= 0) return;
+    const key = todayKey();
+    setDailyLog((prev) => {
+      const next = { ...prev, [key]: { ...(prev[key] || {}) } };
+      next[key][subjectId] = (next[key][subjectId] || 0) + secs;
+      storageSet('daily-log', next);
+      return next;
+    });
+  }, []);
+
+  // ---- timer tick ----
+  useEffect(() => {
+    if (!running) return;
+    const iv = setInterval(() => {
+      if (mode === 'stopwatch') {
+        setStopwatchSeconds((s) => s + 1);
+      } else {
+        setSecondsLeft((s) => {
+          if (s <= 1) {
+            if (!onBreak) {
+              logTime(selectedSubject, pomodoroFocus);
+              notify('Focus session khatam!', 'Break time — thoda aaram karo.');
+              setOnBreak(true);
+              return pomodoroBreak;
+            } else {
+              notify('Break khatam!', 'Wapas focus shuru karte hai.');
+              setOnBreak(false);
+              return pomodoroFocus;
+            }
+          }
+          return s - 1;
+        });
+      }
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [running, mode, onBreak, pomodoroFocus, pomodoroBreak, selectedSubject, logTime, notify]);
+
+  // ---- schedule reminder check (every 30s) ----
+  useEffect(() => {
+    const iv = setInterval(() => {
+      const day = currentDayName();
+      const now = new Date();
+      const hhmm = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+      const blocks = schedule[day] || [];
+      blocks.forEach((b) => {
+        const tag = `${todayKey()}-${b.id}`;
+        if (b.start === hhmm && !notifiedRef.current.has(tag)) {
+          notifiedRef.current.add(tag);
+          const subj = subjects.find((x) => x.id === b.subjectId);
+          notify('Schedule reminder', `${subj ? subj.name : 'Study'} ka time ho gaya hai`);
+        }
+      });
+    }, 30000);
+    return () => clearInterval(iv);
+  }, [schedule, subjects, notify]);
+
+  const handleStartPause = () => {
+    if (running) {
+      setRunning(false);
+      if (mode === 'stopwatch' && stopwatchSeconds > 0) {
+        logTime(selectedSubject, stopwatchSeconds);
+        setStopwatchSeconds(0);
+      }
+    } else {
+      setRunning(true);
+    }
+  };
+  const handleReset = () => {
+    setRunning(false);
+    if (mode === 'pomodoro') {
+      setSecondsLeft(pomodoroFocus);
+      setOnBreak(false);
+    } else {
+      setStopwatchSeconds(0);
+    }
+  };
+  const switchMode = (m) => {
+    setRunning(false);
+    setMode(m);
+    setOnBreak(false);
+    setSecondsLeft(pomodoroFocus);
+    setStopwatchSeconds(0);
+  };
+
+  const updatePomodoroDurations = (focusMin, breakMin) => {
+    const f = Math.max(1, focusMin) * 60;
+    const b = Math.max(1, breakMin) * 60;
+    setPomodoroFocus(f);
+    setPomodoroBreak(b);
+    if (!running && !onBreak) setSecondsLeft(f);
+    storageSet('settings', { pomodoroFocus: f, pomodoroBreak: b });
+  };
+
+  // ---- subjects ----
+  const addSubject = (name) => {
+    if (!name.trim()) return;
+    const color = SWATCHES[subjects.length % SWATCHES.length];
+    const next = [...subjects, { id: uid(), name: name.trim(), color }];
+    setSubjects(next);
+    storageSet('subjects', next);
+  };
+  const renameSubject = (id, name) => {
+    const next = subjects.map((s) => (s.id === id ? { ...s, name } : s));
+    setSubjects(next);
+    storageSet('subjects', next);
+  };
+  const recolorSubject = (id, color) => {
+    const next = subjects.map((s) => (s.id === id ? { ...s, color } : s));
+    setSubjects(next);
+    storageSet('subjects', next);
+  };
+  const deleteSubject = (id) => {
+    if (subjects.length <= 1) return;
+    const next = subjects.filter((s) => s.id !== id);
+    setSubjects(next);
+    storageSet('subjects', next);
+    if (selectedSubject === id) setSelectedSubject(next[0].id);
+  };
+
+  // ---- todos ----
+  const addTodo = () => {
+    if (!newTodo.trim()) return;
+    const next = [...todos, { id: uid(), text: newTodo.trim(), done: false, subjectId: newTodoSubject || null }];
+    setTodos(next);
+    storageSet('todos', next);
+    setNewTodo('');
+  };
+  const toggleTodo = (id) => {
+    const next = todos.map((t) => (t.id === id ? { ...t, done: !t.done } : t));
+    setTodos(next);
+    storageSet('todos', next);
+  };
+  const deleteTodo = (id) => {
+    const next = todos.filter((t) => t.id !== id);
+    setTodos(next);
+    storageSet('todos', next);
+  };
+
+  // ---- schedule ----
+  const [newBlock, setNewBlock] = useState({ day: 'Mon', subjectId: subjects[0]?.id || '', start: '18:00', end: '19:00' });
+
+  // keep server copy of schedule + subjects in sync so push reminders work even when app is closed
+  useEffect(() => {
+    if (!ready) return;
+    syncScheduleToServer(deviceId, schedule, subjects);
+  }, [ready, deviceId, schedule, subjects]);
+
+  useEffect(() => {
+    if (!newBlock.subjectId && subjects[0]) setNewBlock((b) => ({ ...b, subjectId: subjects[0].id }));
+  }, [subjects]);
+  const addBlock = () => {
+    const next = { ...schedule, [newBlock.day]: [...(schedule[newBlock.day] || []), { id: uid(), subjectId: newBlock.subjectId, start: newBlock.start, end: newBlock.end }] };
+    next[newBlock.day].sort((a, b) => a.start.localeCompare(b.start));
+    setSchedule(next);
+    storageSet('schedule', next);
+  };
+  const deleteBlock = (day, id) => {
+    const next = { ...schedule, [day]: (schedule[day] || []).filter((b) => b.id !== id) };
+    setSchedule(next);
+    storageSet('schedule', next);
+  };
+
+  // ---- floating widget drag ----
+  const onPointerDown = (e) => {
+    dragRef.current = { sx: e.clientX, sy: e.clientY, ox: pos.x, oy: pos.y };
+  };
+  const onPointerMove = (e) => {
+    if (!dragRef.current) return;
+    setPos({ x: dragRef.current.ox + (e.clientX - dragRef.current.sx), y: dragRef.current.oy + (e.clientY - dragRef.current.sy) });
+  };
+  const onPointerUp = () => { dragRef.current = null; };
+
+  const todayTotal = Object.values(dailyLog[todayKey()] || {}).reduce((a, b) => a + b, 0);
+  const last7 = [...Array(7)].map((_, i) => {
+    const d = new Date();
+    d.setDate(d.getDate() - (6 - i));
+    return d.toISOString().slice(0, 10);
+  });
+  const maxDay = Math.max(1, ...last7.map((k) => Object.values(dailyLog[k] || {}).reduce((a, b) => a + b, 0)));
+
+  const subjName = (id) => subjects.find((s) => s.id === id)?.name || '—';
+  const subjColor = (id) => subjects.find((s) => s.id === id)?.color || '#7C87AE';
+
+  return (
+    <div
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      style={{
+        '--bg': '#12172A',
+        '--surface': '#1B2140',
+        '--surface2': '#232B52',
+        '--paper': '#F4EFE3',
+        '--ink': '#ECE7DA',
+        '--ink-dim': '#9AA3C7',
+        '--accent': '#F2B84C',
+        '--border': '#2E3766',
+        fontFamily: "'Inter', sans-serif",
+        background: 'var(--bg)',
+        color: 'var(--ink)',
+        minHeight: '600px',
+        maxWidth: '420px',
+        margin: '0 auto',
+        borderRadius: '20px',
+        overflow: 'hidden',
+        position: 'relative',
+        boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
+      }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Lora:wght@500;600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
+        .st-serif { font-family: 'Lora', serif; }
+        .st-mono { font-family: 'IBM Plex Mono', monospace; }
+        .st-scroll::-webkit-scrollbar { width: 4px; }
+        .st-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        .st-btn { transition: transform .12s ease, opacity .12s ease; }
+        .st-btn:active { transform: scale(0.96); }
+        input[type="time"]::-webkit-calendar-picker-indicator { filter: invert(1); opacity: 0.6; }
+      `}</style>
+
+      {/* Header */}
+      <div style={{ padding: '20px 20px 16px', borderBottom: '1px solid var(--border)' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div>
+            <div style={{ fontSize: '13px', color: 'var(--ink-dim)', marginBottom: '4px' }}>Aaj ki padhai</div>
+            <div className="st-serif" style={{ fontSize: '30px', fontWeight: 600 }}>{fmtHours(todayTotal)}</div>
+          </div>
+          <button className="st-btn" onClick={() => setShowSubjectPanel(!showSubjectPanel)}
+            style={{ background: 'var(--surface2)', border: 'none', borderRadius: '10px', padding: '9px', color: 'var(--ink)', cursor: 'pointer' }}>
+            <Settings2 size={18} />
+          </button>
+        </div>
+        {notifPermission !== 'granted' && (
+          <button onClick={requestNotif} className="st-btn" style={{ marginTop: '10px', fontSize: '12px', background: 'rgba(242,184,76,0.12)', color: 'var(--accent)', border: '1px solid rgba(242,184,76,0.3)', borderRadius: '8px', padding: '6px 10px', cursor: 'pointer' }}>
+            🔔 Notifications on karo
+          </button>
+        )}
+      </div>
+
+      {/* Subject manager panel */}
+      {showSubjectPanel && (
+        <div style={{ padding: '16px 20px', background: 'var(--surface)', borderBottom: '1px solid var(--border)' }}>
+          <div style={{ fontSize: '13px', color: 'var(--ink-dim)', marginBottom: '10px' }}>Subjects manage karo</div>
+          {subjects.map((s) => (
+            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+              <div style={{ display: 'flex', gap: '4px' }}>
+                {SWATCHES.slice(0, 4).map((c) => (
+                  <button key={c} onClick={() => recolorSubject(s.id, c)} style={{ width: '16px', height: '16px', borderRadius: '50%', background: c, border: s.color === c ? '2px solid var(--ink)' : '2px solid transparent', cursor: 'pointer', padding: 0 }} />
+                ))}
+              </div>
+              <input value={s.name} onChange={(e) => renameSubject(s.id, e.target.value)}
+                style={{ flex: 1, background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: '8px', padding: '6px 10px', color: 'var(--ink)', fontSize: '14px' }} />
+              <button onClick={() => deleteSubject(s.id)} className="st-btn" style={{ background: 'none', border: 'none', color: 'var(--ink-dim)', cursor: 'pointer' }}><X size={16} /></button>
+            </div>
+          ))}
+          <AddInline placeholder="Naya subject add karo" onAdd={addSubject} />
+        </div>
+      )}
+
+      {/* Tab content */}
+      <div className="st-scroll" style={{ padding: '20px', minHeight: '420px', maxHeight: '520px', overflowY: 'auto' }}>
+        {tab === 'timer' && (
+          <div>
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '18px' }}>
+              <TabPill active={mode === 'pomodoro'} onClick={() => switchMode('pomodoro')} label="Pomodoro" />
+              <TabPill active={mode === 'stopwatch'} onClick={() => switchMode('stopwatch')} label="Stopwatch" />
+            </div>
+
+            <div style={{ marginBottom: '18px' }}>
+              <div style={{ fontSize: '12px', color: 'var(--ink-dim)', marginBottom: '6px' }}>Subject</div>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                {subjects.map((s) => (
+                  <button key={s.id} onClick={() => !running && setSelectedSubject(s.id)} className="st-btn"
+                    style={{
+                      padding: '7px 14px', borderRadius: '20px', border: selectedSubject === s.id ? `2px solid ${s.color}` : '1px solid var(--border)',
+                      background: selectedSubject === s.id ? `${s.color}22` : 'var(--surface2)', color: 'var(--ink)', fontSize: '13px', cursor: running ? 'default' : 'pointer',
+                    }}>
+                    {s.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ textAlign: 'center', padding: '30px 0' }}>
+              {mode === 'pomodoro' && onBreak && (
+                <div style={{ fontSize: '13px', color: 'var(--accent)', marginBottom: '8px' }}>☕ Break time</div>
+              )}
+              <div className="st-mono" style={{ fontSize: '58px', fontWeight: 600, letterSpacing: '2px' }}>
+                {fmtClock(mode === 'pomodoro' ? secondsLeft : stopwatchSeconds)}
+              </div>
+              <div style={{ display: 'flex', gap: '14px', justifyContent: 'center', marginTop: '22px' }}>
+                <button onClick={handleReset} className="st-btn" style={{ background: 'var(--surface2)', border: 'none', borderRadius: '50%', width: '48px', height: '48px', color: 'var(--ink)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <RotateCcw size={18} />
+                </button>
+                <button onClick={handleStartPause} className="st-btn" style={{ background: 'var(--accent)', border: 'none', borderRadius: '50%', width: '64px', height: '64px', color: '#1B2140', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  {running ? <Pause size={24} /> : <Play size={24} style={{ marginLeft: '2px' }} />}
+                </button>
+                <button onClick={() => setFloating(true)} className="st-btn" style={{ background: 'var(--surface2)', border: 'none', borderRadius: '50%', width: '48px', height: '48px', color: 'var(--ink)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Radio size={18} />
+                </button>
+              </div>
+              <div style={{ fontSize: '11px', color: 'var(--ink-dim)', marginTop: '14px' }}>Floating mode ke liye antenna icon dabao</div>
+            </div>
+
+            {mode === 'pomodoro' && (
+              <div style={{ display: 'flex', gap: '12px', marginTop: '10px', paddingTop: '18px', borderTop: '1px solid var(--border)' }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: '11px', color: 'var(--ink-dim)', marginBottom: '4px' }}>Focus (min)</div>
+                  <input type="number" min="1" value={pomodoroFocus / 60}
+                    onChange={(e) => updatePomodoroDurations(Number(e.target.value), pomodoroBreak / 60)}
+                    style={{ width: '100%', background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: '8px', padding: '8px', color: 'var(--ink)' }} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: '11px', color: 'var(--ink-dim)', marginBottom: '4px' }}>Break (min)</div>
+                  <input type="number" min="1" value={pomodoroBreak / 60}
+                    onChange={(e) => updatePomodoroDurations(pomodoroFocus / 60, Number(e.target.value))}
+                    style={{ width: '100%', background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: '8px', padding: '8px', color: 'var(--ink)' }} />
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === 'schedule' && (
+          <div>
+            <div className="st-serif" style={{ fontSize: '17px', marginBottom: '14px' }}>Weekly schedule</div>
+            {DAYS.map((day) => (
+              <div key={day} style={{ marginBottom: '14px' }}>
+                <div style={{ fontSize: '12px', color: 'var(--ink-dim)', marginBottom: '6px', fontWeight: 600 }}>{day}</div>
+                {(schedule[day] || []).length === 0 && (
+                  <div style={{ fontSize: '12px', color: 'var(--ink-dim)', opacity: 0.6, marginBottom: '4px' }}>Koi block nahi</div>
+                )}
+                {(schedule[day] || []).map((b) => (
+                  <div key={b.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '10px', padding: '8px 10px', marginBottom: '6px' }}>
+                    <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: subjColor(b.subjectId) }} />
+                    <div style={{ flex: 1, fontSize: '13px' }}>{subjName(b.subjectId)}</div>
+                    <div className="st-mono" style={{ fontSize: '12px', color: 'var(--ink-dim)' }}>{b.start}–{b.end}</div>
+                    <button onClick={() => deleteBlock(day, b.id)} style={{ background: 'none', border: 'none', color: 'var(--ink-dim)', cursor: 'pointer' }}><X size={14} /></button>
+                  </div>
+                ))}
+              </div>
+            ))}
+            <div style={{ marginTop: '16px', padding: '14px', background: 'var(--surface)', borderRadius: '12px', border: '1px solid var(--border)' }}>
+              <div style={{ fontSize: '12px', color: 'var(--ink-dim)', marginBottom: '10px' }}>Naya block add karo</div>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
+                <select value={newBlock.day} onChange={(e) => setNewBlock({ ...newBlock, day: e.target.value })}
+                  style={{ background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: '8px', padding: '7px', color: 'var(--ink)', fontSize: '13px' }}>
+                  {DAYS.map((d) => <option key={d} value={d}>{d}</option>)}
+                </select>
+                <select value={newBlock.subjectId} onChange={(e) => setNewBlock({ ...newBlock, subjectId: e.target.value })}
+                  style={{ background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: '8px', padding: '7px', color: 'var(--ink)', fontSize: '13px', flex: 1 }}>
+                  {subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </select>
+              </div>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                <input type="time" value={newBlock.start} onChange={(e) => setNewBlock({ ...newBlock, start: e.target.value })}
+                  style={{ background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: '8px', padding: '7px', color: 'var(--ink)', fontSize: '13px' }} />
+                <span style={{ color: 'var(--ink-dim)' }}>–</span>
+                <input type="time" value={newBlock.end} onChange={(e) => setNewBlock({ ...newBlock, end: e.target.value })}
+                  style={{ background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: '8px', padding: '7px', color: 'var(--ink)', fontSize: '13px' }} />
+                <button onClick={addBlock} className="st-btn" style={{ marginLeft: 'auto', background: 'var(--accent)', border: 'none', borderRadius: '8px', padding: '8px 12px', color: '#1B2140', cursor: 'pointer' }}><Plus size={16} /></button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {tab === 'todo' && (
+          <div>
+            <div className="st-serif" style={{ fontSize: '17px', marginBottom: '14px' }}>To-do list</div>
+            {todos.length === 0 && <div style={{ fontSize: '13px', color: 'var(--ink-dim)' }}>Koi task nahi hai abhi</div>}
+            {todos.map((t) => (
+              <div key={t.id} style={{ display: 'flex', alignItems: 'center', gap: '10px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '10px', padding: '10px 12px', marginBottom: '8px' }}>
+                <button onClick={() => toggleTodo(t.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.done ? 'var(--accent)' : 'var(--ink-dim)' }}>
+                  <CheckSquare size={18} fill={t.done ? 'var(--accent)' : 'none'} />
+                </button>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: '14px', textDecoration: t.done ? 'line-through' : 'none', opacity: t.done ? 0.5 : 1 }}>{t.text}</div>
+                  {t.subjectId && <div style={{ fontSize: '11px', color: subjColor(t.subjectId) }}>{subjName(t.subjectId)}</div>}
+                </div>
+                <button onClick={() => deleteTodo(t.id)} style={{ background: 'none', border: 'none', color: 'var(--ink-dim)', cursor: 'pointer' }}><X size={14} /></button>
+              </div>
+            ))}
+            <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+              <select value={newTodoSubject} onChange={(e) => setNewTodoSubject(e.target.value)}
+                style={{ background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: '8px', padding: '9px 6px', color: 'var(--ink)', fontSize: '12px' }}>
+                <option value="">—</option>
+                {subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+              <input value={newTodo} onChange={(e) => setNewTodo(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addTodo()}
+                placeholder="Naya task..." style={{ flex: 1, background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: '8px', padding: '9px 12px', color: 'var(--ink)', fontSize: '14px' }} />
+              <button onClick={addTodo} className="st-btn" style={{ background: 'var(--accent)', border: 'none', borderRadius: '8px', padding: '9px 14px', color: '#1B2140', cursor: 'pointer' }}><Plus size={16} /></button>
+            </div>
+          </div>
+        )}
+
+        {tab === 'stats' && (
+          <div>
+            <div className="st-serif" style={{ fontSize: '17px', marginBottom: '4px' }}>Pichhle 7 din</div>
+            <div style={{ display: 'flex', alignItems: 'flex-end', gap: '8px', height: '140px', marginTop: '20px', marginBottom: '10px' }}>
+              {last7.map((k) => {
+                const dayLog = dailyLog[k] || {};
+                const total = Object.values(dayLog).reduce((a, b) => a + b, 0);
+                const h = Math.max(4, (total / maxDay) * 120);
+                return (
+                  <div key={k} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px' }}>
+                    <div style={{ fontSize: '10px', color: 'var(--ink-dim)' }}>{total > 0 ? fmtHours(total) : ''}</div>
+                    <div style={{ width: '100%', maxWidth: '30px', height: `${h}px`, borderRadius: '6px 6px 2px 2px', background: total > 0 ? 'var(--accent)' : 'var(--surface2)' }} />
+                    <div style={{ fontSize: '10px', color: 'var(--ink-dim)' }}>{new Date(k).toLocaleDateString('en-IN', { weekday: 'short' })}</div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ marginTop: '20px', paddingTop: '16px', borderTop: '1px solid var(--border)' }}>
+              <div style={{ fontSize: '13px', color: 'var(--ink-dim)', marginBottom: '10px' }}>Aaj, subject-wise</div>
+              {subjects.map((s) => {
+                const secs = (dailyLog[todayKey()] || {})[s.id] || 0;
+                return (
+                  <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
+                    <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: s.color }} />
+                    <div style={{ flex: 1, fontSize: '13px' }}>{s.name}</div>
+                    <div className="st-mono" style={{ fontSize: '13px', color: 'var(--ink-dim)' }}>{fmtHours(secs)}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Bottom tabs */}
+      <div style={{ display: 'flex', borderTop: '1px solid var(--border)', background: 'var(--surface)' }}>
+        <NavBtn icon={<Clock size={19} />} label="Timer" active={tab === 'timer'} onClick={() => setTab('timer')} />
+        <NavBtn icon={<Calendar size={19} />} label="Schedule" active={tab === 'schedule'} onClick={() => setTab('schedule')} />
+        <NavBtn icon={<CheckSquare size={19} />} label="To-do" active={tab === 'todo'} onClick={() => setTab('todo')} />
+        <NavBtn icon={<BarChart2 size={19} />} label="Stats" active={tab === 'stats'} onClick={() => setTab('stats')} />
+      </div>
+
+      {/* Floating draggable mini timer (in-app only) */}
+      {floating && (
+        <div
+          onPointerDown={onPointerDown}
+          style={{
+            position: 'absolute', left: pos.x, top: pos.y, zIndex: 50, cursor: 'grab',
+            background: 'var(--accent)', color: '#1B2140', borderRadius: '999px',
+            padding: '10px 16px', display: 'flex', alignItems: 'center', gap: '10px',
+            boxShadow: '0 8px 24px rgba(0,0,0,0.35)', userSelect: 'none', touchAction: 'none',
+          }}
+        >
+          <span className="st-mono" style={{ fontWeight: 600, fontSize: '15px' }}>
+            {fmtClock(mode === 'pomodoro' ? secondsLeft : stopwatchSeconds)}
+          </span>
+          <button onClick={handleStartPause} style={{ background: 'rgba(27,33,64,0.15)', border: 'none', borderRadius: '50%', width: '26px', height: '26px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#1B2140' }}>
+            {running ? <Pause size={13} /> : <Play size={13} />}
+          </button>
+          <button onClick={() => setFloating(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#1B2140', opacity: 0.7 }}>
+            <X size={15} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NavBtn({ icon, label, active, onClick }) {
+  return (
+    <button onClick={onClick} className="st-btn" style={{
+      flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px',
+      padding: '12px 0', background: 'none', border: 'none', cursor: 'pointer',
+      color: active ? 'var(--accent)' : 'var(--ink-dim)',
+    }}>
+      {icon}
+      <span style={{ fontSize: '10px' }}>{label}</span>
+    </button>
+  );
+}
+
+function TabPill({ active, onClick, label }) {
+  return (
+    <button onClick={onClick} className="st-btn" style={{
+      flex: 1, padding: '9px 0', borderRadius: '10px', border: 'none', cursor: 'pointer', fontSize: '13px', fontWeight: 600,
+      background: active ? 'var(--accent)' : 'var(--surface2)', color: active ? '#1B2140' : 'var(--ink-dim)',
+    }}>{label}</button>
+  );
+}
+
+function AddInline({ placeholder, onAdd }) {
+  const [val, setVal] = useState('');
+  return (
+    <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+      <input value={val} onChange={(e) => setVal(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && (onAdd(val), setVal(''))}
+        placeholder={placeholder} style={{ flex: 1, background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: '8px', padding: '7px 10px', color: 'var(--ink)', fontSize: '13px' }} />
+      <button onClick={() => { onAdd(val); setVal(''); }} className="st-btn" style={{ background: 'var(--accent)', border: 'none', borderRadius: '8px', padding: '7px 12px', color: '#1B2140', cursor: 'pointer' }}><Plus size={14} /></button>
+    </div>
+  );
+}
